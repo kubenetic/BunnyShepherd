@@ -1,4 +1,4 @@
-# BunnySheperd
+# BunnyShepherd
 A small, focused set of RabbitMQ helpers for Go, built on top of github.com/rabbitmq/amqp091-go. It provides:
 - A resilient ConnectionManager with automatic reconnects and clean shutdown
 - A confirm-aware Publisher with lazy channel reinit and backoff retries
@@ -9,12 +9,12 @@ These helpers aim to be pragmatic and production-friendly while keeping the API 
 
 ## Installation
 ```bash
-go get github.com/kubenetic/BunnySheperd
+go get github.com/kubenetic/BunnyShepherd
 ```
 
 Import paths in examples use the module path from go.mod:
-- github.com/kubenetic/BunnySheperd/pkg/rabbitmq
-- github.com/kubenetic/BunnySheperd/pkg/model
+- github.com/kubenetic/BunnyShepherd/pkg/rabbitmq
+- github.com/kubenetic/BunnyShepherd/pkg/model
 
 ## Requirements
 - Go 1.25+
@@ -45,7 +45,7 @@ import (
     "time"
 
     amqp "github.com/rabbitmq/amqp091-go"
-    rmq "github.com/kubenetic/BunnySheperd/pkg/rabbitmq"
+    rmq "github.com/kubenetic/BunnyShepherd/pkg/rabbitmq"
 )
 
 func main() {
@@ -84,8 +84,8 @@ import (
     "log"
     "time"
 
-    rmq "github.com/kubenetic/BunnySheperd/pkg/rabbitmq"
-    "github.com/kubenetic/BunnySheperd/pkg/model"
+    rmq "github.com/kubenetic/BunnyShepherd/pkg/rabbitmq"
+    "github.com/kubenetic/BunnyShepherd/pkg/model"
 )
 
 func main() {
@@ -176,7 +176,7 @@ import (
     "time"
 
     amqp "github.com/rabbitmq/amqp091-go"
-    rmq "github.com/kubenetic/BunnySheperd/pkg/rabbitmq"
+    rmq "github.com/kubenetic/BunnyShepherd/pkg/rabbitmq"
 )
 
 func main() {
@@ -237,7 +237,7 @@ generic envelope that marshals the payload to JSON.
 
 ```go
 import (
-    "github.com/kubenetic/BunnySheperd/pkg/model"
+    "github.com/kubenetic/BunnyShepherd/pkg/model"
     amqp "github.com/rabbitmq/amqp091-go"
 )
 

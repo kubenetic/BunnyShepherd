@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kubenetic/BunnySheperd/pkg/backoff"
-	"github.com/kubenetic/BunnySheperd/pkg/model"
+	"github.com/kubenetic/BunnyShepherd/pkg/backoff"
+	"github.com/kubenetic/BunnyShepherd/pkg/model"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog/log"
 )

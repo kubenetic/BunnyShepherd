@@ -1,4 +1,4 @@
-module github.com/kubenetic/BunnySheperd
+module github.com/kubenetic/BunnyShepherd
 
 go 1.25.3
 
