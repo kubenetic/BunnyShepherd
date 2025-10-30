@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"gitea.com/kubenetic/BunnySheperd/pkg/backoff"
+	"github.com/kubenetic/BunnySheperd/pkg/backoff"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog/log"
 )
@@ -34,6 +34,13 @@ type ConnectionManager struct {
 // The manager establishes the initial connection and starts a background
 // watcher that handles connection close events and automatic reconnection.
 // The provided context controls the lifecycle of the background watcher.
+//
+// Example:
+//
+//	ctx := context.Background()
+//	cm, err := rabbitmq.NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+//	if err != nil { panic(err) }
+//	defer cm.Close()
 func NewConnectionManager(ctx context.Context, url string, config *amqp.Config) (*ConnectionManager, error) {
 	manager := &ConnectionManager{
 		url:      url,

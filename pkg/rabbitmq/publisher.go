@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"gitea.com/kubenetic/BunnySheperd/pkg/backoff"
-	"gitea.com/kubenetic/BunnySheperd/pkg/model"
+	"github.com/kubenetic/BunnySheperd/pkg/backoff"
+	"github.com/kubenetic/BunnySheperd/pkg/model"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog/log"
 )
@@ -91,6 +91,15 @@ func WithConfirmTimeout(d time.Duration) PublisherOption {
 // eagerly initializes an AMQP channel with confirmations enabled. Background
 // goroutines are started to drain returned messages and observe channel close
 // events. Use Close to release resources.
+//
+// Example:
+//
+//	pub, err := rabbitmq.NewPublisher(cm,
+//	    rabbitmq.WithMaxRetries(3),
+//	    rabbitmq.WithInitialBackoff(300*time.Millisecond),
+//	)
+//	if err != nil { panic(err) }
+//	defer pub.Close()
 func NewPublisher(cm *ConnectionManager, opts ...PublisherOption) (*Publisher, error) {
 	// Start from defaults, then apply any provided options.
 	cfg := DefaultPublisherConfig()
@@ -208,6 +217,15 @@ func (p *Publisher) Close() error {
 // and jitter, respecting the caller's context. If ctx is canceled or times out,
 // Publish returns ctx.Err(). When the AMQP channel is missing or closed, it is
 // lazily reinitialized.
+//
+// Example:
+//
+//	msg := &model.JSONMessage[any]{Payload: map[string]any{"job_id": "job-123"}}
+//	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+//	defer cancel()
+//	if err := pub.Publish(ctx, "scan.jobs.x", "scan.jobs", true, msg); err != nil {
+//	    // handle error
+//	}
 func (p *Publisher) Publish(ctx context.Context, exchange, routingKey string, mandatory bool, envelope model.Message) error {
 	startTime := time.Now()
 	// Lazy reinit if the channel is not ready

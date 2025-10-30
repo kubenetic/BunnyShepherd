@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"gitea.com/kubenetic/BunnySheperd/pkg/backoff"
+	"github.com/kubenetic/BunnySheperd/pkg/backoff"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog/log"
 )
@@ -153,6 +153,17 @@ func (c *Consumer) Close() error {
 //
 // The provided context is used to signal the consumer to stop. Subscribe blocks until the context is canceled or
 // the channel is closed.
+//
+// Example:
+//
+//	handler := func(hCtx context.Context, d amqp.Delivery) error {
+//	    // process message
+//	    return d.Ack(false)
+//	}
+//	tag := rabbitmq.GenConsumerTag("worker-1")
+//	if err := consumer.Subscribe(ctx, "scan.jobs.q", tag, handler); err != nil {
+//	    // handle error
+//	}
 func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb MessageHandler) error {
 	backoffTime := c.config.InitialBackoff
 	maxBackoff := c.config.MaxBackoff
