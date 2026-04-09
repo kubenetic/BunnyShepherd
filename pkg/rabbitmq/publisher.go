@@ -158,6 +158,8 @@ func (p *Publisher) reinit() error {
 // invokes the user-provided callback with a bounded context. This function
 // runs in a dedicated goroutine per AMQP channel instance and exits when the
 // broker closes the NotifyReturn channel.
+// The OnReturn callback is invoked synchronously to avoid unbounded goroutine
+// growth under a flood of returned messages.
 func (p *Publisher) handleReturns(returns <-chan amqp.Return) {
 	for ret := range returns {
 		log.Error().
@@ -168,15 +170,11 @@ func (p *Publisher) handleReturns(returns <-chan amqp.Return) {
 			Msg("message returned (unroutable)")
 
 		if p.OnReturn != nil {
-			retCpy := ret
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-
-			go func() {
-				defer cancel()
-				if err := p.OnReturn(ctx, retCpy); err != nil {
-					log.Error().Err(err).Msg("error handling return")
-				}
-			}()
+			if err := p.OnReturn(ctx, ret); err != nil {
+				log.Error().Err(err).Msg("error handling return")
+			}
+			cancel()
 		}
 	}
 }
