@@ -195,8 +195,6 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 		ch := c.conCh
 		c.conMu.Unlock()
 
-		backoffTime = c.config.InitialBackoff
-
 		if consumer == "" {
 			consumer = GenConsumerTag("")
 		}
@@ -221,6 +219,14 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 			}
 		}
 
+		// Reset backoff only after a successful ConsumeWithContext — not after
+		// channel reinit alone. Resetting too early (on reinit) means a channel
+		// that closes immediately after being opened (e.g. due to a poison
+		// message or rapid RabbitMQ flapping) would never accumulate backoff,
+		// causing a tight reinit loop at the initial 500 ms interval.
+		backoffTime = c.config.InitialBackoff
+
+	messageLoop:
 		for {
 			log.Debug().Msg("waiting for message...")
 
@@ -231,14 +237,17 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 
 			case message, ok := <-messages:
 				if !ok {
-					// in case of channel closure, cancel the consumer and force reinitialize the channel
+					// Channel was closed by the broker or a channel-level AMQP error.
+					// Nil out the channel so the outer loop reinitialises it.
+					// Using a labeled break to exit the for loop, not just the select —
+					// a bare break would only exit the select and spin on the closed channel at 100% CPU.
 					c.conMu.Lock()
 					if c.conCh != nil {
 						_ = c.conCh.Cancel(consumer, true)
 						c.conCh = nil
 					}
 					c.conMu.Unlock()
-					break
+					break messageLoop
 				}
 
 				func() {
