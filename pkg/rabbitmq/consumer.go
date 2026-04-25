@@ -31,7 +31,7 @@ func DefaultConsumerConfig() ConsumerConfig {
 	return ConsumerConfig{
 		MessageHandlerTimeout: 30 * time.Second,
 		InitialBackoff:        500 * time.Millisecond,
-		MaxBackoff:            10 * time.Second,
+		MaxBackoff:            5 * time.Minute,
 		PrefetchCount:         1,
 	}
 }
@@ -124,10 +124,10 @@ func (c *Consumer) initConsumerChannel() error {
 	}
 
 	c.conCh = ch
-	c.cra = 1
+	c.cra++
 
 	if c.cra > 1 {
-		log.Debug().Msg("consumer channel reinitialized")
+		log.Debug().Int("attempt", c.cra).Msg("consumer channel reinitialized")
 	} else {
 		log.Debug().Msg("consumer channel initialized")
 	}
@@ -210,7 +210,7 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 				backoffTime *= 2
 				if backoffTime > maxBackoff {
 					log.Error().Msg("backoffTime exceeded")
-					return ctx.Err()
+					return ErrChannelReinitBackoffExceed
 				}
 				continue
 
@@ -228,8 +228,6 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 
 	messageLoop:
 		for {
-			log.Debug().Msg("waiting for message...")
-
 			select {
 			case <-ctx.Done():
 				_ = ch.Cancel(consumer, true)
@@ -249,6 +247,8 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 					c.conMu.Unlock()
 					break messageLoop
 				}
+
+				log.Debug().Msg("message received")
 
 				func() {
 					cbCtx, cbCncl := context.WithTimeout(ctx, 30*time.Second)
