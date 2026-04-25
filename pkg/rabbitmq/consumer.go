@@ -112,6 +112,9 @@ func NewConsumer(cm *ConnectionManager, opts ...ConsumerOption) (*Consumer, erro
 // initConsumerChannel opens a new AMQP channel via the ConnectionManager and
 // applies QoS settings (PrefetchCount). It replaces any previously held
 // consumer channel and prepares the Consumer for subscriptions.
+// cra (channel reinit attempts) is incremented on each call and reset to 0
+// by Subscribe after a successful ConsumeWithContext, so it reflects the
+// number of consecutive reinit attempts in the current failure streak.
 func (c *Consumer) initConsumerChannel() error {
 	ch, err := c.cm.getChannel()
 	if err != nil {
@@ -176,13 +179,13 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 				c.conMu.Unlock()
 
 				sleep := backoff.Jitter(backoffTime)
+				backoffTime *= 2
+				if backoffTime > maxBackoff {
+					log.Error().Msg("backoffTime exceeded")
+					return ErrChannelReinitBackoffExceed
+				}
 				select {
 				case <-time.After(sleep):
-					backoffTime *= 2
-					if backoffTime > maxBackoff {
-						log.Error().Msg("backoffTime exceeded")
-						return ErrChannelReinitBackoffExceed
-					}
 					continue
 
 				case <-ctx.Done():
@@ -204,14 +207,18 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 		if err != nil {
 			log.Error().Err(err).Msg("error consuming messages")
 
+			c.conMu.Lock()
+			c.conCh = nil
+			c.conMu.Unlock()
+
 			sleep := backoff.Jitter(backoffTime)
+			backoffTime *= 2
+			if backoffTime > maxBackoff {
+				log.Error().Msg("backoffTime exceeded")
+				return ErrChannelReinitBackoffExceed
+			}
 			select {
 			case <-time.After(sleep):
-				backoffTime *= 2
-				if backoffTime > maxBackoff {
-					log.Error().Msg("backoffTime exceeded")
-					return ErrChannelReinitBackoffExceed
-				}
 				continue
 
 			case <-ctx.Done():
@@ -219,12 +226,13 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 			}
 		}
 
-		// Reset backoff only after a successful ConsumeWithContext — not after
-		// channel reinit alone. Resetting too early (on reinit) means a channel
+		// Reset backoff and reinit counter only after a successful ConsumeWithContext —
+		// not after channel reinit alone. Resetting too early (on reinit) means a channel
 		// that closes immediately after being opened (e.g. due to a poison
 		// message or rapid RabbitMQ flapping) would never accumulate backoff,
 		// causing a tight reinit loop at the initial 500 ms interval.
 		backoffTime = c.config.InitialBackoff
+		c.cra = 0
 
 	messageLoop:
 		for {
@@ -251,7 +259,7 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 				log.Debug().Msg("message received")
 
 				func() {
-					cbCtx, cbCncl := context.WithTimeout(ctx, 30*time.Second)
+					cbCtx, cbCncl := context.WithTimeout(ctx, c.config.MessageHandlerTimeout)
 					defer cbCncl()
 
 					defer func() {
