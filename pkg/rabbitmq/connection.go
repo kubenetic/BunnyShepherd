@@ -3,6 +3,7 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"sync"
 	"time"
 
@@ -10,6 +11,42 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog/log"
 )
+
+// sanitizeAMQPURL removes credentials from an AMQP URL for safe logging.
+func sanitizeAMQPURL(raw string) string {
+	if raw == "" {
+		return "amqp://***"
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "amqp://***"
+	}
+
+	// Check if URL has a scheme; if not, treat as malformed
+	if u.Scheme == "" {
+		return "amqp://***"
+	}
+
+	// If there are credentials, replace them with ***
+	if u.User != nil {
+		// Manually reconstruct to avoid URL encoding of the asterisks
+		host := u.Host
+		if u.Port() != "" {
+			host = u.Hostname() + ":" + u.Port()
+		}
+		result := u.Scheme + "://***@" + host + u.Path
+		if u.RawQuery != "" {
+			result += "?" + u.RawQuery
+		}
+		if u.Fragment != "" {
+			result += "#" + u.Fragment
+		}
+		return result
+	}
+
+	return u.String()
+}
 
 // ConnectionManager manages a single RabbitMQ connection and provides utilities
 // to get channels, monitor connection health, and perform automatic reconnection
@@ -63,20 +100,24 @@ func NewConnectionManager(ctx context.Context, url string, config *amqp.Config) 
 func (m *ConnectionManager) connect(url string, config *amqp.Config) (err error) {
 	m.Lock()
 	if config == nil {
-		log.Debug().Msg("connecting to rabbitmq with default config")
+		log.Debug().Str("url", sanitizeAMQPURL(url)).Msg("connecting to rabbitmq with default config")
 		m.connection, err = amqp.Dial(url)
-		m.config = m.connection.Config
+		if err == nil {
+			m.config = m.connection.Config
+		}
 	} else {
-		log.Debug().Msg("connecting to rabbitmq with custom config")
+		log.Debug().Str("url", sanitizeAMQPURL(url)).Msg("connecting to rabbitmq with custom config")
 		m.connection, err = amqp.DialConfig(url, *config)
-		m.config = *config
+		if err == nil {
+			m.config = *config
+		}
 	}
 	m.Unlock()
 
 	if err != nil {
-		return fmt.Errorf("error connecting to rabbitmq: %w", err)
+		return fmt.Errorf("error connecting to rabbitmq (%s): %w", sanitizeAMQPURL(url), err)
 	}
-	log.Debug().Msg("connected to rabbitmq")
+	log.Debug().Str("url", sanitizeAMQPURL(url)).Msg("connected to rabbitmq")
 
 	m.notifyChannel = make(chan *amqp.Error)
 	m.connection.NotifyClose(m.notifyChannel)
@@ -91,6 +132,11 @@ func (m *ConnectionManager) watch(ctx context.Context) {
 	defer m.wg.Done()
 
 	for {
+		// Acquire read lock to get current notifyChannel
+		m.RLock()
+		notifyCh := m.notifyChannel
+		m.RUnlock()
+
 		select {
 		case <-ctx.Done():
 			if err := m.cleanup(); err != nil {
@@ -104,12 +150,16 @@ func (m *ConnectionManager) watch(ctx context.Context) {
 			}
 			return
 
-		case err, ok := <-m.notifyChannel:
+		case err, ok := <-notifyCh:
 			if !ok {
-				if err := m.cleanup(); err != nil {
-					log.Error().Err(err).Msg("error closing connection")
+				// Channel closed cleanly (e.g., broker graceful restart).
+				// Attempt reconnection instead of exiting permanently.
+				log.Warn().Msg("rabbitmq notify channel closed (clean disconnect); attempting reconnection")
+				_ = m.cleanup()
+				if err := m.reconnectionLoop(ctx); err != nil {
+					log.Error().Err(err).Msg("error reconnecting to rabbitmq after clean disconnect")
 				}
-				return
+				continue
 			}
 
 			log.Error().Err(err).Msg("rabbitmq connection closed")
@@ -187,7 +237,7 @@ func (m *ConnectionManager) cleanup() error {
 
 // getChannel returns a new AMQP channel created from the current managed
 // connection. It is intended for internal use by components in this package.
-// It returns ErrConnectionNotInitilized if the connection has not been
+// It returns ErrConnectionNotInitialized if the connection has not been
 // established yet, or ErrConnectionClosed if the existing connection is
 // closed.
 func (m *ConnectionManager) getChannel() (*amqp.Channel, error) {
@@ -196,7 +246,7 @@ func (m *ConnectionManager) getChannel() (*amqp.Channel, error) {
 	m.RUnlock()
 
 	if conn == nil {
-		return nil, ErrConnectionNotInitilized
+		return nil, ErrConnectionNotInitialized
 	}
 
 	if conn.IsClosed() {

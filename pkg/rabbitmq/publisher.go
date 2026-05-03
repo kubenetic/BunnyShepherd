@@ -55,6 +55,13 @@ type Publisher struct {
 	// Optional callback for handling unroutable messages. If nil, unroutable messages
 	// will be logged on error level and discarded.
 	OnReturn ReturnHandler
+
+	// Handler lifecycle management to prevent goroutine leaks
+	handlersCancel context.CancelFunc
+	handlersWg     sync.WaitGroup
+
+	// In-flight publish tracking for graceful close
+	inflightWg sync.WaitGroup
 }
 
 // PublisherOption defines a function that modifies the Publisher configuration.
@@ -120,7 +127,14 @@ func NewPublisher(cm *ConnectionManager, opts ...PublisherOption) (*Publisher, e
 // wires up NotifyReturn/NotifyClose handlers, and swaps the internal fields.
 // It assumes the ConnectionManager will handle reconnecting the underlying
 // connection if needed.
+// MUST be called under the publisher mutex.
 func (p *Publisher) reinit() error {
+	// Cancel and wait for any existing handlers before creating new ones
+	if p.handlersCancel != nil {
+		p.handlersCancel()
+		p.handlersWg.Wait()
+	}
+
 	ch, err := p.cm.getChannel()
 	if err != nil {
 		return err
@@ -141,8 +155,20 @@ func (p *Publisher) reinit() error {
 	p.returns = returns
 	p.closes = closes
 
-	go p.handleReturns(p.returns)
-	go p.handleClose(p.ch, p.closes)
+	// Create a new context for the handler goroutines
+	handlerCtx, cancel := context.WithCancel(context.Background())
+	p.handlersCancel = cancel
+
+	// Start handler goroutines with proper lifecycle management
+	p.handlersWg.Add(2)
+	go func() {
+		defer p.handlersWg.Done()
+		p.handleReturns(handlerCtx, returns)
+	}()
+	go func() {
+		defer p.handlersWg.Done()
+		p.handleClose(handlerCtx, ch, closes)
+	}()
 
 	p.pra = p.pra + 1
 	if p.pra > 1 {
@@ -157,55 +183,141 @@ func (p *Publisher) reinit() error {
 // handleReturns logs unroutable returned messages and, if OnReturn is set,
 // invokes the user-provided callback with a bounded context. This function
 // runs in a dedicated goroutine per AMQP channel instance and exits when the
-// broker closes the NotifyReturn channel.
+// broker closes the NotifyReturn channel or the context is cancelled.
 // The OnReturn callback is invoked synchronously to avoid unbounded goroutine
 // growth under a flood of returned messages.
-func (p *Publisher) handleReturns(returns <-chan amqp.Return) {
-	for ret := range returns {
-		log.Error().
-			Str("exchange", ret.Exchange).
-			Str("routingKey", ret.RoutingKey).
-			Uint16("replyCode", ret.ReplyCode).
-			Str("text", ret.ReplyText).
-			Msg("message returned (unroutable)")
-
-		if p.OnReturn != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if err := p.OnReturn(ctx, ret); err != nil {
-				log.Error().Err(err).Msg("error handling return")
+func (p *Publisher) handleReturns(ctx context.Context, returns <-chan amqp.Return) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ret, ok := <-returns:
+			if !ok {
+				return
 			}
-			cancel()
+			log.Error().
+				Str("exchange", ret.Exchange).
+				Str("routingKey", ret.RoutingKey).
+				Uint16("replyCode", ret.ReplyCode).
+				Str("text", ret.ReplyText).
+				Msg("message returned (unroutable)")
+
+			if p.OnReturn != nil {
+				cbCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if err := p.OnReturn(cbCtx, ret); err != nil {
+					log.Error().Err(err).Msg("error handling return")
+				}
+				cancel()
+			}
 		}
 	}
 }
 
 // handleClose observes close notifications for a specific AMQP channel
 // instance. If the observed channel is still the one referenced by the
-// publisher, it marks the channel as unusable, so the next Publish lazily
-// reinitialized it. Runs in its own goroutine and exits when the notification
-// channel is closed.
-func (p *Publisher) handleClose(ch *amqp.Channel, closes <-chan *amqp.Error) {
-	if err, ok := <-closes; ok && err != nil {
-		log.Error().Err(err).Msg("publisher channel closed; will attempt lazy reinit on next publish")
-		// Mark channel unusable; next Publish will reinit lazily
-		p.mu.Lock()
-		if p.ch == ch {
-			p.ch = nil
+// publisher, it marks the channel as unusable so the next Publish lazily
+// reinitialises it. Runs in its own goroutine and exits when the notification
+// channel is closed or the context is cancelled.
+//
+// Deadlock-avoidance note: this function intentionally uses a short-lived
+// TryLock pattern under context cancellation. If the parent (Close) is already
+// holding p.mu while draining handlersWg, a blocking p.mu.Lock() here would
+// deadlock. Instead we race ctx.Done() against mutex acquisition; if the ctx
+// was cancelled first (i.e. Close is shutting us down) we exit without
+// touching p.ch — Close will close the channel itself.
+func (p *Publisher) handleClose(ctx context.Context, ch *amqp.Channel, closes <-chan *amqp.Error) {
+	select {
+	case <-ctx.Done():
+		return
+	case err, ok := <-closes:
+		if !ok || err == nil {
+			return
 		}
-		p.mu.Unlock()
+		log.Error().Err(err).Msg("publisher channel closed; will attempt lazy reinit on next publish")
+
+		// Acquire the mutex without deadlocking against Close. We retry
+		// TryLock in a tight loop (polling) with a short backoff, and bail out
+		// if the context was cancelled in the meantime — which is exactly the
+		// Close-is-running case.
+		for {
+			if p.mu.TryLock() {
+				if p.ch == ch {
+					p.ch = nil
+				}
+				p.mu.Unlock()
+				return
+			}
+			select {
+			case <-ctx.Done():
+				// Close is running; it will take care of clearing / closing ch.
+				return
+			case <-time.After(5 * time.Millisecond):
+				// Retry
+			}
+		}
 	}
 }
 
-// Close releases the current AMQP channel if it is open. It is safe to call
-// multiple times. Background goroutines will exit once the broker closes the
-// notification channels for the closed AMQP channel.
+// Close releases the current AMQP channel if it is open and waits for in-flight
+// publishes to complete (with a 5-second timeout). It is safe to call multiple times.
+// Background handler goroutines are cancelled and waited for before returning.
 func (p *Publisher) Close() error {
+	return p.CloseWithContext(context.Background())
+}
+
+// CloseWithContext releases the current AMQP channel if it is open and waits for
+// in-flight publishes to complete within the provided context timeout. Background
+// handler goroutines are cancelled and waited for before returning.
+//
+// Ordering (avoids deadlock with handleClose):
+//  1. Capture the cancel func under the lock, release the lock.
+//  2. Cancel the handler context WITHOUT holding p.mu — handleClose may be
+//     trying to acquire p.mu after observing a broker-side close; cancelling
+//     its context lets it bail out via TryLock/ctx.Done (see handleClose).
+//  3. Wait for in-flight publishes and handlers to drain, still without the lock.
+//  4. Finally re-acquire the lock for the channel-close fastpath.
+func (p *Publisher) CloseWithContext(ctx context.Context) error {
+	// Step 1: capture cancel under the lock.
+	p.mu.Lock()
+	cancel := p.handlersCancel
+	p.handlersCancel = nil
+	p.mu.Unlock()
+
+	// Step 2: cancel outside the lock.
+	if cancel != nil {
+		cancel()
+	}
+
+	// Step 3a: wait for in-flight publishes (bounded by caller ctx AND 5s).
+	done := make(chan struct{})
+	go func() {
+		p.inflightWg.Wait()
+		close(done)
+	}()
+
+	timeout := time.After(5 * time.Second)
+	select {
+	case <-done:
+		// All in-flight publishes completed
+	case <-ctx.Done():
+		log.Warn().Msg("timeout waiting for in-flight publishes during close (caller ctx)")
+	case <-timeout:
+		log.Warn().Msg("timeout waiting for in-flight publishes during close (5s)")
+	}
+
+	// Step 3b: wait for handlers. They will observe the cancelled ctx and
+	// exit cleanly without attempting to acquire p.mu.
+	p.handlersWg.Wait()
+
+	// Step 4: close the channel under the lock.
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
 	if p.ch != nil && !p.ch.IsClosed() {
-		return p.ch.Close()
+		err := p.ch.Close()
+		p.ch = nil
+		return err
 	}
+	p.ch = nil
 	return nil
 }
 
@@ -216,6 +328,15 @@ func (p *Publisher) Close() error {
 // Publish returns ctx.Err(). When the AMQP channel is missing or closed, it is
 // lazily reinitialized.
 //
+// Concurrency: amqp091 channels are NOT safe for concurrent use
+// (see https://pkg.go.dev/github.com/rabbitmq/amqp091-go#Channel). This method
+// therefore holds p.mu for the entire publish — including the deferred-confirm
+// wait — so that two concurrent Publish calls on the same Publisher are
+// serialized. The serialization is conceptually free: amqp091 already
+// serializes per-channel operations internally, and this Publisher uses a
+// single channel. If you need higher throughput, create multiple Publisher
+// instances on separate channels.
+//
 // Example:
 //
 //	msg := &model.JSONMessage[any]{Payload: map[string]any{"job_id": "job-123"}}
@@ -225,17 +346,27 @@ func (p *Publisher) Close() error {
 //	    // handle error
 //	}
 func (p *Publisher) Publish(ctx context.Context, exchange, routingKey string, mandatory bool, envelope model.Message) error {
-	startTime := time.Now()
-	// Lazy reinit if the channel is not ready
+	// Track in-flight for graceful Close. Incremented before we take the
+	// publisher lock so Close's drain loop observes every publish.
+	p.inflightWg.Add(1)
+	defer p.inflightWg.Done()
+
+	// Hold p.mu for the entire publish. amqp091 Channel is not safe for
+	// concurrent use; serializing here makes the publisher correct.
 	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	startTime := time.Now()
+
+	// Lazy reinit if the channel is not ready. Both the nil/closed check and
+	// reinit are protected by the mutex to prevent concurrent reinit attempts.
+	// amqp091 channels are not safe for concurrent use, so we serialize all
+	// channel operations under p.mu.
 	if p.ch == nil || p.ch.IsClosed() {
 		if err := p.reinit(); err != nil {
-			p.mu.Unlock()
 			return err
 		}
 	}
-	ch := p.ch
-	p.mu.Unlock()
 
 	maxRetries := p.config.MaxRetries
 	backoffTime := p.config.InitialBackoff
@@ -248,6 +379,7 @@ func (p *Publisher) Publish(ctx context.Context, exchange, routingKey string, ma
 			return fmt.Errorf("error getting message payload: %w", err)
 		}
 
+		ch := p.ch // snapshot for this attempt; reassigned on reinit below
 		dc, err := ch.PublishWithDeferredConfirmWithContext(
 			ctx, exchange, routingKey, mandatory, false,
 			amqp.Publishing{
@@ -262,16 +394,12 @@ func (p *Publisher) Publish(ctx context.Context, exchange, routingKey string, ma
 		)
 
 		if err != nil {
-			// If the channel/connection is closed, try to reinit and retry
+			// If the channel/connection is closed, try to reinit and retry.
 			if errors.Is(err, amqp.ErrClosed) || (ch != nil && ch.IsClosed()) {
 				lastErr = err
-
-				p.mu.Lock()
 				if rerr := p.reinit(); rerr != nil {
 					lastErr = rerr
 				}
-				ch = p.ch
-				p.mu.Unlock()
 			} else {
 				return err
 			}
@@ -308,12 +436,9 @@ func (p *Publisher) Publish(ctx context.Context, exchange, routingKey string, ma
 
 				lastErr = ErrConfirmTimeout
 
-				// Close the channel to force reinit on the next publication
+				// Close the channel to force reinit on the next attempt.
 				_ = ch.Close()
-
-				p.mu.Lock()
 				p.ch = nil
-				p.mu.Unlock()
 			}
 		}
 

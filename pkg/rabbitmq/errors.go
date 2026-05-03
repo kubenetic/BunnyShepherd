@@ -11,7 +11,12 @@ func (e MQError) Error() string {
 const (
 	// ErrConnectionNotInitilized is returned when an operation requires an active
 	// connection but the ConnectionManager has not yet established one.
+	// Deprecated: use ErrConnectionNotInitialized instead.
 	ErrConnectionNotInitilized MQError = "connection not initialized"
+
+	// ErrConnectionNotInitialized is returned when an operation requires an active
+	// connection but the ConnectionManager has not yet established one.
+	ErrConnectionNotInitialized MQError = "connection not initialized"
 
 	// ErrConnectionClosed is returned when an operation cannot proceed because the
 	// underlying AMQP connection has already been closed.
@@ -34,4 +39,8 @@ const (
 	// ErrRepublishBackoffExceed indicates publish retries exceeded the maximum
 	// backoff window without succeeding.
 	ErrRepublishBackoffExceed MQError = "republish backoff exceeded"
+
+	// ErrAlreadySubscribed indicates that Subscribe was called on a Consumer that
+	// is already subscribed to a queue.
+	ErrAlreadySubscribed MQError = "consumer already subscribed"
 )

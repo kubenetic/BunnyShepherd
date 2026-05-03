@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kubenetic/BunnyShepherd/pkg/backoff"
@@ -40,7 +41,8 @@ func DefaultConsumerConfig() ConsumerConfig {
 // built on top of ConnectionManager. It will manage consumer channels,
 // subscriptions, and graceful shutdown semantics.
 //
-// Consumer is not safe for concurrent use.
+// Consumer is not safe for concurrent use. Subscribe should be called once
+// per Consumer instance; subsequent calls will return ErrAlreadySubscribed.
 type Consumer struct {
 	config ConsumerConfig
 	cm     *ConnectionManager
@@ -48,6 +50,13 @@ type Consumer struct {
 	conCh *amqp.Channel
 	cra   int // consumer reinit attempts
 	conMu sync.Mutex
+
+	// Subscription state management
+	running atomic.Bool
+	stopCh  chan struct{}
+
+	// Handler lifecycle management
+	handlerWg sync.WaitGroup
 }
 
 // ConsumerOption defines a function that modifies the Consumer configuration.
@@ -100,6 +109,7 @@ func NewConsumer(cm *ConnectionManager, opts ...ConsumerOption) (*Consumer, erro
 	c := &Consumer{
 		cm:     cm,
 		config: cfg,
+		stopCh: make(chan struct{}),
 	}
 
 	if err := c.initConsumerChannel(); err != nil {
@@ -115,6 +125,7 @@ func NewConsumer(cm *ConnectionManager, opts ...ConsumerOption) (*Consumer, erro
 // cra (channel reinit attempts) is incremented on each call and reset to 0
 // by Subscribe after a successful ConsumeWithContext, so it reflects the
 // number of consecutive reinit attempts in the current failure streak.
+// MUST be called under the conMu lock.
 func (c *Consumer) initConsumerChannel() error {
 	ch, err := c.cm.getChannel()
 	if err != nil {
@@ -138,21 +149,57 @@ func (c *Consumer) initConsumerChannel() error {
 	return nil
 }
 
-// Close closes the underlying consumer AMQP channel if it is open. It is safe
-// to call multiple times.
+// Close closes the underlying consumer AMQP channel if it is open and waits for
+// any in-flight message handlers to complete (with a 5-second timeout). It is safe
+// to call multiple times and safe to call concurrently with Subscribe.
 func (c *Consumer) Close() error {
+	// Signal the active subscription (if any) to stop. Guard the close with
+	// conMu so we don't race Subscribe's stopCh re-creation nor
+	// double-close on concurrent Close calls. We probe the channel via a
+	// non-blocking receive: an open channel yields default, a closed channel
+	// yields zero-value with ok=false — the second case means someone has
+	// already closed it and we must not close again (would panic).
+	c.conMu.Lock()
+	select {
+	case <-c.stopCh:
+		// already closed — no-op
+	default:
+		close(c.stopCh)
+	}
+	c.conMu.Unlock()
+
+	// Wait for handlers with timeout
+	done := make(chan struct{})
+	go func() {
+		c.handlerWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All handlers completed
+	case <-time.After(5 * time.Second):
+		log.Warn().Msg("timeout waiting for message handlers during close")
+	}
+
 	c.conMu.Lock()
 	defer c.conMu.Unlock()
 
 	if c.conCh != nil && !c.conCh.IsClosed() {
 		return c.conCh.Close()
 	}
-
 	return nil
 }
 
 // Subscribe initializes a consumer to a specified queue and processes messages using the provided MessageHandler
 // callback.
+//
+// Concurrency: Subscribe is safe to call only once AT A TIME per Consumer
+// instance — a concurrent second Subscribe returns ErrAlreadySubscribed.
+// SERIAL re-subscription is supported: Subscribe → return-on-ctx-cancel or
+// Subscribe → Close → Subscribe works cleanly. The implementation recreates
+// the internal stop channel on each Subscribe entry so a previously-closed
+// one does not short-circuit the new subscription's select loops.
 //
 // The provided context is used to signal the consumer to stop. Subscribe blocks until the context is canceled or
 // the channel is closed.
@@ -168,8 +215,34 @@ func (c *Consumer) Close() error {
 //	    // handle error
 //	}
 func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb MessageHandler) error {
+	// Ensure Subscribe is only active once per Consumer instance at a time.
+	// Two concurrent Subscribe calls on the same instance are rejected with
+	// ErrAlreadySubscribed. Serial re-subscription (Subscribe → Close →
+	// Subscribe) is supported: the second Subscribe sees running=false (set
+	// by the first Subscribe's defer on return), the CAS succeeds, and we
+	// recreate stopCh below so the previously-closed channel doesn't
+	// immediately short-circuit our select loops.
+	if !c.running.CompareAndSwap(false, true) {
+		return ErrAlreadySubscribed
+	}
+	defer c.running.Store(false)
+
+	// Recreate stopCh for this subscription iff the previous one was closed.
+	// Guarded by conMu so Close cannot race with us here.
+	c.conMu.Lock()
+	select {
+	case <-c.stopCh:
+		// Previous stopCh was closed by a prior Close — allocate a fresh one
+		// for this subscription so case <-c.stopCh doesn't fire immediately.
+		c.stopCh = make(chan struct{})
+	default:
+		// Still usable as-is.
+	}
+	c.conMu.Unlock()
+
 	backoffTime := c.config.InitialBackoff
 	maxBackoff := c.config.MaxBackoff
+	backoffReset := false // Track if we've successfully received a message
 
 	for ctx.Err() == nil {
 		// Lazy reinit if the channel is not ready with retry logic
@@ -190,11 +263,14 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 
 				case <-ctx.Done():
 					return ctx.Err()
+
+				case <-c.stopCh:
+					return nil
 				}
 			}
 		}
 
-		// Channel is ready, proceed with consuming messages
+		// Channel is ready, capture reference under lock and proceed with consuming messages
 		ch := c.conCh
 		c.conMu.Unlock()
 
@@ -223,16 +299,14 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 
 			case <-ctx.Done():
 				return ctx.Err()
+
+			case <-c.stopCh:
+				return nil
 			}
 		}
 
-		// Reset backoff and reinit counter only after a successful ConsumeWithContext —
-		// not after channel reinit alone. Resetting too early (on reinit) means a channel
-		// that closes immediately after being opened (e.g. due to a poison
-		// message or rapid RabbitMQ flapping) would never accumulate backoff,
-		// causing a tight reinit loop at the initial 500 ms interval.
-		backoffTime = c.config.InitialBackoff
-		c.cra = 0
+		// Reset backoff only after first successful message delivery (not after ConsumeWithContext)
+		backoffReset = false
 
 	messageLoop:
 		for {
@@ -240,6 +314,10 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 			case <-ctx.Done():
 				_ = ch.Cancel(consumer, true)
 				return ctx.Err()
+
+			case <-c.stopCh:
+				_ = ch.Cancel(consumer, true)
+				return nil
 
 			case message, ok := <-messages:
 				if !ok {
@@ -258,20 +336,33 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 
 				log.Debug().Msg("message received")
 
+				// Reset backoff only after first successful message delivery
+				if !backoffReset {
+					backoffTime = c.config.InitialBackoff
+					c.conMu.Lock()
+					c.cra = 0
+					c.conMu.Unlock()
+					backoffReset = true
+				}
+
+				c.handlerWg.Add(1)
 				func() {
+					defer c.handlerWg.Done()
+
 					cbCtx, cbCncl := context.WithTimeout(ctx, c.config.MessageHandlerTimeout)
 					defer cbCncl()
 
 					defer func() {
 						if r := recover(); r != nil {
-							log.Error().Msg("panic in message handler")
+							log.Error().Interface("panic", r).Msg("panic in message handler")
 							_ = message.Nack(false, false)
 						}
 					}()
 
 					if err := cb(cbCtx, message); err != nil {
 						log.Error().Err(err).Msg("error handling message")
-						_ = message.Nack(false, false)
+						requeue := ShouldRequeue(err)
+						_ = message.Nack(false, requeue)
 					}
 				}()
 			}
