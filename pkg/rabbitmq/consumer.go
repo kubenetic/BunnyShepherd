@@ -17,7 +17,95 @@ import (
 // nil on success. On error, the consumer will Nack the message without requeue.
 // Implementations should be fast and resilient; panics are recovered and the
 // message is negatively acknowledged.
+//
+// Deprecated: Use SafeHandler instead. SafeHandler provides explicit ack semantics
+// and prevents message loss due to handler crashes or forgotten acks.
 type MessageHandler func(ctx context.Context, message amqp.Delivery) error
+
+// Outcome represents the result of processing a message by a SafeHandler.
+// The library uses this to determine whether to ack, nack, or requeue the message.
+type Outcome int
+
+const (
+	// Ack indicates successful processing — the message is acknowledged and removed from the queue.
+	Ack Outcome = iota
+	// Reject indicates permanent failure — the message is negatively acknowledged without requeue,
+	// typically sending it to a dead-letter exchange if configured.
+	Reject
+	// RequeueOutcome indicates transient failure — the message is negatively acknowledged with requeue,
+	// returning it to the queue for retry. Callers must implement retry limits to avoid infinite loops;
+	// see bunny-H01-no-poison-message-handling.md for bounded retry patterns.
+	RequeueOutcome
+)
+
+// String returns a human-readable representation of the Outcome.
+func (o Outcome) String() string {
+	switch o {
+	case Ack:
+		return "Ack"
+	case Reject:
+		return "Reject"
+	case RequeueOutcome:
+		return "Requeue"
+	default:
+		return "Unknown"
+	}
+}
+
+// Delivery wraps an AMQP delivery for use with SafeHandler.
+// It provides read-only access to message metadata and body.
+type Delivery struct {
+	Body            []byte
+	ContentType     string
+	ContentEncoding string
+	Headers         amqp.Table
+	Priority        uint8
+	CorrelationId   string
+	ReplyTo         string
+	Expiration      string
+	MessageId       string
+	Timestamp       time.Time
+	Type            string
+	UserId          string
+	AppId           string
+	DeliveryTag     uint64
+	Redelivered     bool
+	Exchange        string
+	RoutingKey      string
+}
+
+// newDeliveryFromAMQP converts an amqp.Delivery to a Delivery.
+func newDeliveryFromAMQP(d amqp.Delivery) Delivery {
+	return Delivery{
+		Body:            d.Body,
+		ContentType:     d.ContentType,
+		ContentEncoding: d.ContentEncoding,
+		Headers:         d.Headers,
+		Priority:        d.Priority,
+		CorrelationId:   d.CorrelationId,
+		ReplyTo:         d.ReplyTo,
+		Expiration:      d.Expiration,
+		MessageId:       d.MessageId,
+		Timestamp:       d.Timestamp,
+		Type:            d.Type,
+		UserId:          d.UserId,
+		AppId:           d.AppId,
+		DeliveryTag:     d.DeliveryTag,
+		Redelivered:     d.Redelivered,
+		Exchange:        d.Exchange,
+		RoutingKey:      d.RoutingKey,
+	}
+}
+
+// SafeHandler processes a single delivered message and returns an explicit Outcome.
+// The library guarantees that ack/nack is performed based on the returned Outcome,
+// so handlers cannot accidentally lose messages by forgetting to ack or by crashing
+// after acking but before completing work.
+//
+// If the handler panics, the library recovers and treats it as Reject.
+// If the handler returns an error, it is logged but does not affect the Outcome
+// (the Outcome is authoritative).
+type SafeHandler func(ctx context.Context, msg Delivery) (Outcome, error)
 
 // ConsumerConfig holds configuration for Consumer behavior.
 type ConsumerConfig struct {
@@ -57,6 +145,11 @@ type Consumer struct {
 
 	// Handler lifecycle management
 	handlerWg sync.WaitGroup
+
+	// Per-message context tracking for graceful channel close
+	// Maps delivery tag to cancel function for in-flight handlers
+	inflightMu sync.Mutex
+	inflight   map[uint64]context.CancelFunc
 }
 
 // ConsumerOption defines a function that modifies the Consumer configuration.
@@ -97,6 +190,9 @@ func WithPrefetchCount(n int) ConsumerOption {
 // NewConsumer constructs a Consumer bound to the provided ConnectionManager.
 // It applies the given options over DefaultConsumerConfig, initializes an
 // AMQP channel configured with the desired QoS, and returns the ready Consumer.
+//
+// If the ConnectionManager was created with a plaintext amqp:// URI (not amqps://)
+// and the host is not localhost or 127.0.0.1, a warning is logged.
 func NewConsumer(cm *ConnectionManager, opts ...ConsumerOption) (*Consumer, error) {
 	// Start from defaults, then apply any provided options.
 	cfg := DefaultConsumerConfig()
@@ -107,9 +203,10 @@ func NewConsumer(cm *ConnectionManager, opts ...ConsumerOption) (*Consumer, erro
 	}
 
 	c := &Consumer{
-		cm:     cm,
-		config: cfg,
-		stopCh: make(chan struct{}),
+		cm:       cm,
+		config:   cfg,
+		stopCh:   make(chan struct{}),
+		inflight: make(map[uint64]context.CancelFunc),
 	}
 
 	if err := c.initConsumerChannel(); err != nil {
@@ -168,6 +265,9 @@ func (c *Consumer) Close() error {
 	}
 	c.conMu.Unlock()
 
+	// Cancel all in-flight handlers
+	c.onChannelClose()
+
 	// Wait for handlers with timeout
 	done := make(chan struct{})
 	go func() {
@@ -189,6 +289,20 @@ func (c *Consumer) Close() error {
 		return c.conCh.Close()
 	}
 	return nil
+}
+
+// onChannelClose cancels all in-flight per-message contexts when the AMQP channel closes.
+// This allows handlers to observe the cancellation and abort gracefully without attempting
+// to ack/nack on a closed channel.
+func (c *Consumer) onChannelClose() {
+	c.inflightMu.Lock()
+	defer c.inflightMu.Unlock()
+
+	for _, cancel := range c.inflight {
+		cancel()
+	}
+	// Clear the map after cancelling all
+	c.inflight = make(map[uint64]context.CancelFunc)
 }
 
 // Subscribe initializes a consumer to a specified queue and processes messages using the provided MessageHandler
@@ -372,7 +486,275 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 	return ctx.Err()
 }
 
-// GenConsumerTag builds a consumer tag incorporating the hostname and process
+// ConsumeWithSafeHandler initializes a consumer to a specified queue and processes messages
+// using the provided SafeHandler callback. Unlike Subscribe, ConsumeWithSafeHandler guarantees
+// that ack/nack is performed based on the handler's returned Outcome, preventing message loss
+// due to handler crashes or forgotten acks.
+//
+// Concurrency: ConsumeWithSafeHandler is safe to call only once AT A TIME per Consumer
+// instance — a concurrent second call returns ErrAlreadySubscribed.
+// SERIAL re-subscription is supported: ConsumeWithSafeHandler → return-on-ctx-cancel or
+// ConsumeWithSafeHandler → Close → ConsumeWithSafeHandler works cleanly.
+//
+// The provided context is used to signal the consumer to stop. ConsumeWithSafeHandler blocks
+// until the context is canceled or the channel is closed.
+//
+// Panics in the handler are recovered and treated as Reject (permanent failure).
+// Returned errors are logged but do not affect the Outcome (the Outcome is authoritative).
+//
+// Example:
+//
+//	handler := func(hCtx context.Context, d Delivery) (Outcome, error) {
+//	    // process message
+//	    if err := processMessage(d.Body); err != nil {
+//	        return Reject, err
+//	    }
+//	    return Ack, nil
+//	}
+//	tag := rabbitmq.GenConsumerTag("worker-1")
+//	if err := consumer.ConsumeWithSafeHandler(ctx, "scan.jobs.q", tag, handler); err != nil {
+//	    // handle error
+//	}
+func (c *Consumer) ConsumeWithSafeHandler(ctx context.Context, queue, consumer string, cb SafeHandler) error {
+	// Ensure ConsumeWithSafeHandler is only active once per Consumer instance at a time.
+	if !c.running.CompareAndSwap(false, true) {
+		return ErrAlreadySubscribed
+	}
+	defer c.running.Store(false)
+
+	// Recreate stopCh for this subscription iff the previous one was closed.
+	c.conMu.Lock()
+	select {
+	case <-c.stopCh:
+		c.stopCh = make(chan struct{})
+	default:
+	}
+	c.conMu.Unlock()
+
+	backoffTime := c.config.InitialBackoff
+	maxBackoff := c.config.MaxBackoff
+	backoffReset := false
+
+	for ctx.Err() == nil {
+		// Lazy reinit if the channel is not ready with retry logic
+		c.conMu.Lock()
+		if c.conCh == nil || c.conCh.IsClosed() {
+			if err := c.initConsumerChannel(); err != nil {
+				c.conMu.Unlock()
+
+				sleep := backoff.Jitter(backoffTime)
+				backoffTime *= 2
+				if backoffTime > maxBackoff {
+					log.Error().Msg("backoffTime exceeded")
+					return ErrChannelReinitBackoffExceed
+				}
+				select {
+				case <-time.After(sleep):
+					continue
+
+				case <-ctx.Done():
+					return ctx.Err()
+
+				case <-c.stopCh:
+					return nil
+				}
+			}
+		}
+
+		// Channel is ready, capture reference under lock and proceed with consuming messages
+		ch := c.conCh
+		c.conMu.Unlock()
+
+		if consumer == "" {
+			consumer = GenConsumerTag("")
+		}
+
+		messages, err := ch.ConsumeWithContext(
+			ctx, queue, consumer, false, false, false, false, nil)
+		if err != nil {
+			log.Error().Err(err).Msg("error consuming messages")
+
+			c.conMu.Lock()
+			c.conCh = nil
+			c.conMu.Unlock()
+
+			sleep := backoff.Jitter(backoffTime)
+			backoffTime *= 2
+			if backoffTime > maxBackoff {
+				log.Error().Msg("backoffTime exceeded")
+				return ErrChannelReinitBackoffExceed
+			}
+			select {
+			case <-time.After(sleep):
+				continue
+
+			case <-ctx.Done():
+				return ctx.Err()
+
+			case <-c.stopCh:
+				return nil
+			}
+		}
+
+		// Reset backoff only after first successful message delivery (not after ConsumeWithContext)
+		backoffReset = false
+
+	messageLoopSafe:
+		for {
+			select {
+			case <-ctx.Done():
+				_ = ch.Cancel(consumer, true)
+				return ctx.Err()
+
+			case <-c.stopCh:
+				_ = ch.Cancel(consumer, true)
+				return nil
+
+			case message, ok := <-messages:
+				if !ok {
+					// Channel was closed by the broker or a channel-level AMQP error.
+					c.conMu.Lock()
+					if c.conCh != nil {
+						_ = c.conCh.Cancel(consumer, true)
+						c.conCh = nil
+					}
+					c.conMu.Unlock()
+					break messageLoopSafe
+				}
+
+				log.Debug().Msg("message received")
+
+				// Reset backoff only after first successful message delivery
+				if !backoffReset {
+					backoffTime = c.config.InitialBackoff
+					c.conMu.Lock()
+					c.cra = 0
+					c.conMu.Unlock()
+					backoffReset = true
+				}
+
+				c.handlerWg.Add(1)
+				func() {
+					defer c.handlerWg.Done()
+
+					// Create per-message context derived from the consumer context
+					perMsgCtx, cancel := context.WithCancel(ctx)
+					deliveryTag := message.DeliveryTag
+
+					// Track this in-flight handler
+					c.inflightMu.Lock()
+					c.inflight[deliveryTag] = cancel
+					c.inflightMu.Unlock()
+
+					// Ensure cleanup on handler completion
+					defer func() {
+						c.inflightMu.Lock()
+						delete(c.inflight, deliveryTag)
+						c.inflightMu.Unlock()
+						cancel()
+					}()
+
+					cbCtx, cbCncl := context.WithTimeout(perMsgCtx, c.config.MessageHandlerTimeout)
+					defer cbCncl()
+
+					// Recover from panics and treat as Reject
+					var outcome Outcome
+					var handlerErr error
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								log.Error().Interface("panic", r).Msg("panic in message handler; rejecting message")
+								outcome = Reject
+							}
+						}()
+						outcome, handlerErr = cb(cbCtx, newDeliveryFromAMQP(message))
+					}()
+
+					// Log error if present, but outcome is authoritative
+					if handlerErr != nil {
+						log.Warn().Err(handlerErr).Str("outcome", outcome.String()).Msg("handler returned error")
+					}
+
+					// If the channel was closed during processing, do not attempt ack/nack
+					if perMsgCtx.Err() != nil {
+						log.Warn().Msg("channel closed during processing; skipping ack/nack")
+						return
+					}
+
+					// Perform ack/nack based on outcome
+					switch outcome {
+					case Ack:
+						_ = message.Ack(false)
+					case Reject:
+						_ = message.Nack(false, false) // go to DLX
+					case RequeueOutcome:
+						_ = message.Nack(false, true) // back to queue
+					default:
+						// Defensive: unknown outcome → Reject, log error
+						log.Error().Err(handlerErr).Str("outcome", outcome.String()).Msg("unknown outcome; rejecting")
+						_ = message.Nack(false, false)
+					}
+				}()
+			}
+		}
+	}
+
+	return ctx.Err()
+}
+
+// RequeueWithLimit is a helper that converts a Requeue outcome to Reject if the
+// message has already been redelivered N times. It inspects the x-death header
+// (automatically populated by RabbitMQ when a message is nacked with requeue=false
+// via a dead-letter exchange) to count redeliveries.
+//
+// This prevents poison messages from starving the queue. Use this in handlers that
+// return Requeue to implement bounded retry:
+//
+//	if err := processMessage(msg); err != nil {
+//	    return consumer.RequeueWithLimit(msg, 5), err
+//	}
+//
+// Default max redeliveries is 5. After N redeliveries, the message is rejected
+// and sent to the dead-letter exchange (if configured on the queue).
+func (c *Consumer) RequeueWithLimit(d Delivery, maxRedeliveries int) Outcome {
+	deaths := countXDeathHeaders(d.Headers)
+	if deaths >= maxRedeliveries {
+		log.Warn().
+			Int("deaths", deaths).
+			Int("maxRedeliveries", maxRedeliveries).
+			Str("messageId", d.MessageId).
+			Msg("message exceeded max redeliveries; rejecting to DLQ")
+		return Reject
+	}
+	return RequeueOutcome
+}
+
+// countXDeathHeaders counts the number of times a message has been dead-lettered
+// by inspecting the x-death header. RabbitMQ automatically populates this header
+// when a message is nacked with requeue=false and a dead-letter exchange is configured.
+// Returns 0 if the header is not present or malformed.
+func countXDeathHeaders(headers amqp.Table) int {
+	if headers == nil {
+		return 0
+	}
+
+	// x-death is an array of tables, each representing a dead-letter event
+	xDeathRaw, ok := headers["x-death"]
+	if !ok {
+		return 0
+	}
+
+	// Type assert to []interface{} (how amqp.Table stores arrays)
+	xDeathArray, ok := xDeathRaw.([]interface{})
+	if !ok {
+		return 0
+	}
+
+	// Each entry in the array is a table representing one death event.
+	// The length of the array is the number of times the message has been dead-lettered.
+	return len(xDeathArray)
+}
+
 // id. If id is non-empty, it is included to help distinguish multiple
 // consumers within the same process or host.
 func GenConsumerTag(id string) string {

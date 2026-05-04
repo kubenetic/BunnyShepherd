@@ -3,21 +3,27 @@
 package backoff
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"time"
 )
 
-var (
-	rng   = rand.New(rand.NewSource(time.Now().UnixNano()))
-	rngMu sync.Mutex
-)
+var rngMu sync.Mutex
 
 // Jitter adds a small random component (up to 25% of d) to the provided
-// duration. It is safe for concurrent use.
+// duration. For non-positive d, it returns d unchanged.
+// It is safe for concurrent use.
+// Uses math/rand/v2 for better seeding and unpredictability.
 func Jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	half := int64(d) / 2
+	if half <= 0 {
+		return d
+	}
 	rngMu.Lock()
-	n := rng.Int63n(int64(d/4) + 1)
+	n := rand.N(half)
 	rngMu.Unlock()
 	return d + time.Duration(n)
 }

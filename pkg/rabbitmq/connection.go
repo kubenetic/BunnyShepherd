@@ -48,6 +48,40 @@ func sanitizeAMQPURL(raw string) string {
 	return u.String()
 }
 
+// isLocalhost checks if the given hostname is localhost or 127.0.0.1.
+func isLocalhost(hostname string) bool {
+	if hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1" {
+		return true
+	}
+	return false
+}
+
+// warnIfPlaintextNonLocal logs a warning if the URI uses plaintext amqp:// with a non-local host.
+func warnIfPlaintextNonLocal(uri string) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return
+	}
+
+	// Only warn for plaintext amqp:// (not amqps://)
+	if u.Scheme != "amqp" {
+		return
+	}
+
+	hostname := u.Hostname()
+	if hostname == "" {
+		return
+	}
+
+	// Warn if not localhost
+	if !isLocalhost(hostname) {
+		log.Warn().
+			Str("scheme", u.Scheme).
+			Str("host", hostname).
+			Msg("using plaintext amqp:// with non-local host; consider using amqps:// with TLS")
+	}
+}
+
 // ConnectionManager manages a single RabbitMQ connection and provides utilities
 // to get channels, monitor connection health, and perform automatic reconnection
 // with exponential backoff.
@@ -98,6 +132,9 @@ func NewConnectionManager(ctx context.Context, url string, config *amqp.Config) 
 // or the library defaults. On success, it updates the manager state and
 // registers a NotifyClose channel to observe connection close events.
 func (m *ConnectionManager) connect(url string, config *amqp.Config) (err error) {
+	// Warn if using plaintext with non-local host
+	warnIfPlaintextNonLocal(url)
+
 	m.Lock()
 	if config == nil {
 		log.Debug().Str("url", sanitizeAMQPURL(url)).Msg("connecting to rabbitmq with default config")
@@ -178,6 +215,8 @@ func (m *ConnectionManager) watch(ctx context.Context) {
 func (m *ConnectionManager) reconnectionLoop(ctx context.Context) error {
 	backoffTime := 1 * time.Second
 	maxBackoff := 32 * time.Second
+	attempt := 0
+	var lastErr error
 
 	for {
 		select {
@@ -185,14 +224,21 @@ func (m *ConnectionManager) reconnectionLoop(ctx context.Context) error {
 			return nil
 
 		case <-time.After(backoffTime):
+			attempt++
 			if err := m.connect(m.url, &m.config); err == nil {
 				log.Debug().Msg("successfully reconnected to rabbitmq")
 				return nil
+			} else {
+				lastErr = err
 			}
 
 			backoffTime = backoff.Jitter(backoffTime * 2)
 			if backoffTime > maxBackoff {
-				return fmt.Errorf("max reconnection backoff reached")
+				log.Error().
+					Int("attempts", attempt).
+					Err(lastErr).
+					Msg("max reconnection backoff reached; giving up")
+				return fmt.Errorf("max reconnection backoff reached after %d attempts: %w", attempt, lastErr)
 			}
 		}
 	}

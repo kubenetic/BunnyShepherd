@@ -44,11 +44,12 @@ func DefaultPublisherConfig() PublisherConfig {
 // channel on first use and reuses it on later calls. The channel is closed
 // when the publisher is closed. Publisher is not safe for concurrent use.
 type Publisher struct {
-	cm      *ConnectionManager
-	ch      *amqp.Channel
-	returns chan amqp.Return
-	closes  chan *amqp.Error
-	mu      sync.Mutex
+	cm       *ConnectionManager
+	ch       *amqp.Channel
+	confirms chan amqp.Confirmation
+	returns  chan amqp.Return
+	closes   chan *amqp.Error
+	mu       sync.Mutex
 
 	pra    int // publish reinit attempts
 	config PublisherConfig
@@ -145,6 +146,8 @@ func (p *Publisher) reinit() error {
 	}
 
 	// Prepare fresh notify channels and goroutines.
+	confirms := make(chan amqp.Confirmation, 128)
+	ch.NotifyPublish(confirms)
 	returns := make(chan amqp.Return, 128)
 	ch.NotifyReturn(returns)
 	closes := make(chan *amqp.Error, 1)
@@ -152,6 +155,7 @@ func (p *Publisher) reinit() error {
 
 	// Swap fields only after successful setup
 	p.ch = ch
+	p.confirms = confirms
 	p.returns = returns
 	p.closes = closes
 
@@ -380,7 +384,11 @@ func (p *Publisher) Publish(ctx context.Context, exchange, routingKey string, ma
 		}
 
 		ch := p.ch // snapshot for this attempt; reassigned on reinit below
-		dc, err := ch.PublishWithDeferredConfirmWithContext(
+
+		// Get the next sequence number before publishing
+		seq := ch.GetNextPublishSeqNo()
+
+		err = ch.PublishWithContext(
 			ctx, exchange, routingKey, mandatory, false,
 			amqp.Publishing{
 				CorrelationId: envelope.GetCorrelationId(),
@@ -404,23 +412,29 @@ func (p *Publisher) Publish(ctx context.Context, exchange, routingKey string, ma
 				return err
 			}
 		} else {
+			// Wait for the publisher confirm for this sequence number
 			select {
 			case <-ctx.Done():
 				log.Warn().Msg("publish cancelled by the caller")
 				return ctx.Err()
 
-			case <-dc.Done():
-				if dc.Acked() {
+			case confirm := <-p.confirms:
+				if confirm.DeliveryTag != seq {
+					log.Error().
+						Uint64("expectedSeq", seq).
+						Uint64("gotSeq", confirm.DeliveryTag).
+						Msg("confirm sequence mismatch")
+					lastErr = fmt.Errorf("confirm sequence mismatch: got %d, want %d", confirm.DeliveryTag, seq)
+				} else if !confirm.Ack {
+					log.Warn().
+						Int("attempt", attempt).
+						Uint64("deliveryTag", seq).
+						Msg("publish nacked by broker; will retry")
+					lastErr = ErrNacked
+				} else {
+					// Successfully acked
 					return nil
 				}
-
-				log.Warn().
-					Int("attempt", attempt).
-					Uint64("deliveryTag", dc.DeliveryTag).
-					Msg("publish failed; will retry")
-
-				// Nack: treat as transient and retry a few times
-				lastErr = ErrNacked
 
 			case <-time.After(confirmTimeout):
 				elapsed := time.Since(startTime)
@@ -431,8 +445,8 @@ func (p *Publisher) Publish(ctx context.Context, exchange, routingKey string, ma
 					Str("messageId", envelope.GetMessageId()).
 					Int("attempt", attempt).
 					Dur("elapsed", elapsed).
-					Uint64("deliveryTag", dc.DeliveryTag).
-					Msg("publish timed out; closing channel and retry")
+					Uint64("deliveryTag", seq).
+					Msg("publish confirm timeout; closing channel and retry")
 
 				lastErr = ErrConfirmTimeout
 
