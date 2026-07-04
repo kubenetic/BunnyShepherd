@@ -2,6 +2,7 @@ package rabbitmq
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net/url"
 	"sync"
@@ -126,6 +127,59 @@ func NewConnectionManager(ctx context.Context, url string, config *amqp.Config) 
 	go manager.watch(ctx)
 
 	return manager, nil
+}
+
+// NewConnectionManagerFromCredentials creates a ConnectionManager from
+// individual credential components instead of a pre-built URL string.
+//
+// This is the recommended approach when credentials may contain special
+// characters (%, <, >, (, ), ?, ! etc.), because it passes the username and
+// password directly through SASL PlainAuth — bypassing URL parsing entirely.
+// No percent-encoding of credentials is required by the caller.
+//
+// scheme must be "amqp" or "amqps".
+// port may be 0 to use the scheme default.
+// vhost may be empty to use the default vhost ("/").
+// tlsConfig may be nil; if non-nil it is used for TLS (typically with "amqps").
+//
+// Example:
+//
+//	cm, err := rabbitmq.NewConnectionManagerFromCredentials(
+//	    ctx,
+//	    "amqp", "bunny", "TzE%F2u18Gkqt4GTISv?<ZLx166(98v!",
+//	    "rabbitmq.example.com", 5672, "uploads",
+//	    nil,
+//	)
+func NewConnectionManagerFromCredentials(
+	ctx context.Context,
+	scheme, user, password, host string,
+	port int,
+	vhost string,
+	tlsConfig *tls.Config,
+) (*ConnectionManager, error) {
+	// Build a credential-free URL — credentials travel via SASL, not the URL.
+	credentialFreeURL, err := BuildAMQPURL(scheme, "", "", host, port, vhost)
+	if err != nil {
+		return nil, fmt.Errorf("building AMQP URL: %w", err)
+	}
+
+	effectiveVhost := vhost
+	if effectiveVhost == "" {
+		effectiveVhost = "/"
+	}
+
+	cfg := amqp.Config{
+		SASL: []amqp.Authentication{
+			&amqp.PlainAuth{
+				Username: user,
+				Password: password,
+			},
+		},
+		Vhost:           effectiveVhost,
+		TLSClientConfig: tlsConfig,
+	}
+
+	return NewConnectionManager(ctx, credentialFreeURL, &cfg)
 }
 
 // connect establishes a new AMQP connection using either the provided config
