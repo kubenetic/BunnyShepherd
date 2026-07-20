@@ -76,19 +76,24 @@ func (m *JSONMessage[T]) GetPayload() ([]byte, error) {
 
 // SafeHandler is the handler type used by the consumer for safe message processing.
 // It is defined here for use by IdempotentHandler.
+//
+// Deprecated: This type is no longer used by IdempotentHandler.Handle, which
+// accepts a plain func() closure instead. It is retained only for API compatibility.
 type SafeHandler func(ctx context.Context, msg interface{}) (interface{}, error)
 
-// IdempotentHandler wraps a SafeHandler and ensures that duplicate message IDs
+// IdempotentHandler wraps a handler closure and ensures that duplicate message IDs
 // are not processed more than once within a bounded cache window. It uses a
 // two-generation cache to prevent unbounded memory growth.
 //
-// If the message ID is empty, the message is passed through to the inner handler
+// Callers supply the actual handler as a closure to Handle, not at construction time.
+// This allows the same IdempotentHandler instance to be reused across different
+// handler functions while sharing the deduplication cache.
+//
+// If the message ID is empty, the message is passed through to the handler
 // without caching (no idempotency guarantee for empty IDs).
 //
 // The handler is safe for concurrent use.
 type IdempotentHandler struct {
-	inner SafeHandler
-
 	// Two-generation cache: current and previous.
 	// When current reaches capacity, it becomes previous and a new current is created.
 	mu       sync.Mutex
@@ -97,14 +102,16 @@ type IdempotentHandler struct {
 	capacity int
 }
 
-// NewIdempotentHandler creates a new IdempotentHandler wrapping the provided
-// SafeHandler with a bounded cache of the given capacity.
+// NewIdempotentHandler creates a new IdempotentHandler with a bounded cache of
+// the given capacity. The inner parameter is accepted for API compatibility but
+// is not stored or invoked — pass nil. Supply the actual handler as a closure
+// to each Handle call instead.
 func NewIdempotentHandler(inner SafeHandler, capacity int) *IdempotentHandler {
+	_ = inner // accepted for API compatibility; not stored (was never invoked)
 	if capacity <= 0 {
 		capacity = 1000
 	}
 	return &IdempotentHandler{
-		inner:    inner,
 		current:  make(map[string]struct{}, capacity),
 		previous: make(map[string]struct{}),
 		capacity: capacity,

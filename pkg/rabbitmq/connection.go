@@ -288,10 +288,10 @@ func (m *ConnectionManager) reconnectionLoop(ctx context.Context) error {
 
 			backoffTime = backoff.Jitter(backoffTime * 2)
 			if backoffTime > maxBackoff {
-				log.Error().
+				log.Warn().
 					Int("attempts", attempt).
 					Err(lastErr).
-					Msg("max reconnection backoff reached; giving up")
+					Msg("max reconnection backoff reached for this cycle; will retry from max backoff")
 				return fmt.Errorf("max reconnection backoff reached after %d attempts: %w", attempt, lastErr)
 			}
 		}
