@@ -729,30 +729,63 @@ func (c *Consumer) RequeueWithLimit(d Delivery, maxRedeliveries int) Outcome {
 	return RequeueOutcome
 }
 
-// countXDeathHeaders counts the number of times a message has been dead-lettered
-// by inspecting the x-death header. RabbitMQ automatically populates this header
-// when a message is nacked with requeue=false and a dead-letter exchange is configured.
-// Returns 0 if the header is not present or malformed.
+// countXDeathHeaders counts the total number of times a message has been
+// dead-lettered by summing the "count" field across all x-death table entries.
+//
+// RabbitMQ's dead-letter semantics: when a message is dead-lettered from the
+// same (queue, reason) pair more than once, RabbitMQ increments the "count"
+// field of the existing entry rather than appending a new entry. Counting
+// array length therefore under-counts and allows poison messages to bypass
+// the requeue limit. Summing "count" across all entries gives the true total.
+//
+// The "count" field is encoded by RabbitMQ as a long integer; amqp091-go
+// decodes it as int64. For robustness, int32 and plain int are also handled.
+//
+// Returns 0 if the header is absent, malformed, or contains no valid entries.
 func countXDeathHeaders(headers amqp.Table) int {
 	if headers == nil {
 		return 0
 	}
 
-	// x-death is an array of tables, each representing a dead-letter event
+	// x-death is an array of tables, each representing a dead-letter event.
 	xDeathRaw, ok := headers["x-death"]
 	if !ok {
 		return 0
 	}
 
-	// Type assert to []interface{} (how amqp.Table stores arrays)
+	// Type assert to []interface{} (how amqp.Table stores arrays).
 	xDeathArray, ok := xDeathRaw.([]interface{})
 	if !ok {
 		return 0
 	}
 
-	// Each entry in the array is a table representing one death event.
-	// The length of the array is the number of times the message has been dead-lettered.
-	return len(xDeathArray)
+	// Sum the "count" field across all entries.
+	// RabbitMQ increments "count" within an existing entry when the same
+	// (queue, reason) pair dead-letters the message again, so the array
+	// length stays 1 while count grows — we must sum, not len().
+	total := 0
+	for _, entry := range xDeathArray {
+		table, ok := entry.(amqp.Table)
+		if !ok {
+			continue
+		}
+		countRaw, ok := table["count"]
+		if !ok {
+			continue
+		}
+		switch v := countRaw.(type) {
+		case int64:
+			total += int(v)
+		case int32:
+			total += int(v)
+		case int:
+			total += v
+		}
+		// Other numeric types are intentionally ignored; they are not
+		// produced by RabbitMQ or amqp091-go and would indicate a
+		// malformed header — treating them as 0 is the safe default.
+	}
+	return total
 }
 
 // id. If id is non-empty, it is included to help distinguish multiple
