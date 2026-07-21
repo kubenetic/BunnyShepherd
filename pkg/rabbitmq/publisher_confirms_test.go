@@ -40,7 +40,7 @@ func (m *MockMessage) GetHeaders() amqp.Table {
 // TestPublisherConfirmTimeout tests that Publish returns an error when confirm timeout occurs.
 func TestPublisherConfirmTimeout(t *testing.T) {
 	ctx := context.Background()
-	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil, WithInitialConnectMaxElapsed(-1))
 	if err != nil {
 		t.Skipf("skipping: cannot connect to RabbitMQ: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestPublisherConfirmTimeout(t *testing.T) {
 // TestPublisherConfirmTimeoutConfigurable tests that confirm timeout is configurable.
 func TestPublisherConfirmTimeoutConfigurable(t *testing.T) {
 	ctx := context.Background()
-	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil, WithInitialConnectMaxElapsed(-1))
 	if err != nil {
 		t.Skipf("skipping: cannot connect to RabbitMQ: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestPublisherConfirmTimeoutConfigurable(t *testing.T) {
 // TestPublisherConfirmDefaultTimeout tests that the default confirm timeout is 5 seconds.
 func TestPublisherConfirmDefaultTimeout(t *testing.T) {
 	ctx := context.Background()
-	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil, WithInitialConnectMaxElapsed(-1))
 	if err != nil {
 		t.Skipf("skipping: cannot connect to RabbitMQ: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestPublisherConfirmDefaultTimeout(t *testing.T) {
 // TestPublisherConfirmChannelInitialization tests that the confirms channel is initialized.
 func TestPublisherConfirmChannelInitialization(t *testing.T) {
 	ctx := context.Background()
-	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil, WithInitialConnectMaxElapsed(-1))
 	if err != nil {
 		t.Skipf("skipping: cannot connect to RabbitMQ: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestPublisherConfirmChannelInitialization(t *testing.T) {
 // TestPublisherConfirmChannelCapacity tests that the confirms channel has proper capacity.
 func TestPublisherConfirmChannelCapacity(t *testing.T) {
 	ctx := context.Background()
-	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil, WithInitialConnectMaxElapsed(-1))
 	if err != nil {
 		t.Skipf("skipping: cannot connect to RabbitMQ: %v", err)
 	}

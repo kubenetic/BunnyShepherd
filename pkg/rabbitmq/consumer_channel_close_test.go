@@ -12,7 +12,7 @@ import (
 // when the channel closes.
 func TestChannelCloseContextCancellation(t *testing.T) {
 	ctx := context.Background()
-	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil, WithInitialConnectMaxElapsed(-1))
 	if err != nil {
 		t.Skipf("skipping: cannot connect to RabbitMQ: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestChannelCloseContextCancellation(t *testing.T) {
 // TestChannelCloseMultipleHandlers tests that onChannelClose cancels all in-flight handlers.
 func TestChannelCloseMultipleHandlers(t *testing.T) {
 	ctx := context.Background()
-	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil, WithInitialConnectMaxElapsed(-1))
 	if err != nil {
 		t.Skipf("skipping: cannot connect to RabbitMQ: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestChannelCloseMultipleHandlers(t *testing.T) {
 // TestInflightMapInitialization tests that the inflight map is properly initialized.
 func TestInflightMapInitialization(t *testing.T) {
 	ctx := context.Background()
-	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil, WithInitialConnectMaxElapsed(-1))
 	if err != nil {
 		t.Skipf("skipping: cannot connect to RabbitMQ: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestInflightMapInitialization(t *testing.T) {
 // TestOnChannelCloseEmptyInflight tests that onChannelClose handles empty inflight map gracefully.
 func TestOnChannelCloseEmptyInflight(t *testing.T) {
 	ctx := context.Background()
-	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil, WithInitialConnectMaxElapsed(-1))
 	if err != nil {
 		t.Skipf("skipping: cannot connect to RabbitMQ: %v", err)
 	}

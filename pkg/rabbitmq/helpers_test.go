@@ -42,6 +42,22 @@ func TestSanitizeAMQPURL(t *testing.T) {
 			input:    "amqps://admin:secret123@rabbitmq.example.com:5671/vhost",
 			expected: "amqps://***@rabbitmq.example.com:5671/vhost",
 		},
+		// N-1: IPv6 literal hosts — brackets must be preserved in output.
+		{
+			name:     "IPv6 with credentials and port",
+			input:    "amqp://guest:password@[::1]:5672/",
+			expected: "amqp://***@[::1]:5672/",
+		},
+		{
+			name:     "amqps IPv6 with credentials and port",
+			input:    "amqps://admin:secret@[2001:db8::1]:5671/vhost",
+			expected: "amqps://***@[2001:db8::1]:5671/vhost",
+		},
+		{
+			name:     "IPv6 without credentials — unchanged",
+			input:    "amqp://[::1]:5672/",
+			expected: "amqp://[::1]:5672/",
+		},
 	}
 
 	for _, tt := range tests {

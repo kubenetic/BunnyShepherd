@@ -13,6 +13,35 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// defaultInitialConnectMaxElapsed is the default upper bound for the initial
+// connection retry loop. Two minutes is chosen because:
+//   - Istio/Envoy sidecar warm-up is typically 5–30 s; 2 min gives ample headroom.
+//   - RabbitMQ cluster rolling restarts complete well within 2 min in practice.
+//   - Kubernetes readiness probes (default failureThreshold=3, periodSeconds=10)
+//     will mark the pod NotReady after ~30 s, but the pod stays alive and keeps
+//     retrying — this is the desired behaviour.
+//   - A genuinely misconfigured endpoint (wrong host/port) will still fail fast
+//     enough (≤2 min) to surface the misconfiguration rather than hanging forever.
+const defaultInitialConnectMaxElapsed = 2 * time.Minute
+
+// connectOptions holds tunable parameters for the initial connection attempt.
+type connectOptions struct {
+	maxElapsed time.Duration // 0 means "use default"; negative means "no retry"
+}
+
+// ConnectionOption is a functional option for NewConnectionManager.
+type ConnectionOption func(*connectOptions)
+
+// WithInitialConnectMaxElapsed sets the maximum total elapsed time for the
+// initial connection retry loop. Use 0 to keep the library default (2 min).
+// Use a negative value (e.g. -1) to disable retry entirely and fail on the
+// first error — useful in tests or when the caller manages its own retry.
+func WithInitialConnectMaxElapsed(d time.Duration) ConnectionOption {
+	return func(o *connectOptions) {
+		o.maxElapsed = d
+	}
+}
+
 // sanitizeAMQPURL removes credentials from an AMQP URL for safe logging.
 func sanitizeAMQPURL(raw string) string {
 	if raw == "" {
@@ -31,12 +60,10 @@ func sanitizeAMQPURL(raw string) string {
 
 	// If there are credentials, replace them with ***
 	if u.User != nil {
-		// Manually reconstruct to avoid URL encoding of the asterisks
-		host := u.Host
-		if u.Port() != "" {
-			host = u.Hostname() + ":" + u.Port()
-		}
-		result := u.Scheme + "://***@" + host + u.Path
+		// u.Host already contains brackets for IPv6 literals and the port in
+		// the correct form (e.g. "[::1]:5672"), so use it directly instead of
+		// reconstructing from Hostname()+":"+Port() which strips the brackets.
+		result := u.Scheme + "://***@" + u.Host + u.Path
 		if u.RawQuery != "" {
 			result += "?" + u.RawQuery
 		}
@@ -98,6 +125,10 @@ type ConnectionManager struct {
 	notifyChannel chan *amqp.Error
 	shutdown      chan bool
 	wg            sync.WaitGroup
+	// dialFn is the low-level dial step called by initialConnectWithRetry.
+	// It is nil in production (the real connect method is used) and can be
+	// replaced in tests to inject a fake without touching a real broker.
+	dialFn func(url string, config *amqp.Config) error
 	sync.RWMutex
 }
 
@@ -107,19 +138,34 @@ type ConnectionManager struct {
 // watcher that handles connection close events and automatic reconnection.
 // The provided context controls the lifecycle of the background watcher.
 //
+// By default the initial connection attempt is retried with jittered
+// exponential backoff (1 s → 32 s per attempt) for up to 2 minutes, mirroring
+// the post-connection reconnection semantics. Pass WithInitialConnectMaxElapsed
+// to override the bound or disable retry entirely.
+//
 // Example:
 //
 //	ctx := context.Background()
 //	cm, err := rabbitmq.NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
 //	if err != nil { panic(err) }
 //	defer cm.Close()
-func NewConnectionManager(ctx context.Context, url string, config *amqp.Config) (*ConnectionManager, error) {
+func NewConnectionManager(ctx context.Context, url string, config *amqp.Config, opts ...ConnectionOption) (*ConnectionManager, error) {
+	o := connectOptions{maxElapsed: 0} // 0 → use default
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	maxElapsed := o.maxElapsed
+	if maxElapsed == 0 {
+		maxElapsed = defaultInitialConnectMaxElapsed
+	}
+
 	manager := &ConnectionManager{
 		url:      url,
 		shutdown: make(chan bool),
 	}
 
-	if err := manager.connect(url, config); err != nil {
+	if err := manager.initialConnectWithRetry(ctx, url, config, maxElapsed); err != nil {
 		return nil, err
 	}
 
@@ -127,6 +173,92 @@ func NewConnectionManager(ctx context.Context, url string, config *amqp.Config) 
 	go manager.watch(ctx)
 
 	return manager, nil
+}
+
+// initialConnectWithRetry attempts to establish the initial AMQP connection,
+// retrying with jittered exponential backoff until success, context
+// cancellation, or maxElapsed is exceeded.
+//
+// When maxElapsed is negative, no retry is performed — the first error is
+// returned immediately. This mirrors the behaviour of the old single-attempt
+// code and is useful for callers that manage their own retry or in tests.
+func (m *ConnectionManager) initialConnectWithRetry(ctx context.Context, url string, config *amqp.Config, maxElapsed time.Duration) error {
+	// dial is the actual dial step. In production it is m.connect; in tests
+	// m.dialFn can be set to a fake that fails N times then succeeds.
+	dial := m.connect
+	if m.dialFn != nil {
+		dial = m.dialFn
+	}
+
+	// Fast path: retry disabled.
+	if maxElapsed < 0 {
+		return dial(url, config)
+	}
+
+	backoffTime := 1 * time.Second
+	maxBackoff := 32 * time.Second
+	deadline := time.Now().Add(maxElapsed)
+	attempt := 0
+
+	for {
+		attempt++
+		err := dial(url, config)
+		if err == nil {
+			if attempt > 1 {
+				log.Info().
+					Int("attempt", attempt).
+					Str("url", sanitizeAMQPURL(url)).
+					Msg("initial rabbitmq connection established after retries")
+			}
+			return nil
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			log.Warn().
+				Int("attempts", attempt).
+				Dur("maxElapsed", maxElapsed).
+				Err(err).
+				Msg("giving up on initial rabbitmq connection: max elapsed time exceeded")
+			return fmt.Errorf("initial rabbitmq connection failed after %d attempt(s) over %s: %w", attempt, maxElapsed, err)
+		}
+
+		// Respect context cancellation.
+		select {
+		case <-ctx.Done():
+			log.Debug().
+				Int("attempts", attempt).
+				Msg("initial rabbitmq connection cancelled by context")
+			return fmt.Errorf("initial rabbitmq connection cancelled after %d attempt(s): %w", attempt, ctx.Err())
+		default:
+		}
+
+		// Cap the sleep to the remaining deadline so we don't overshoot.
+		sleep := backoff.Jitter(backoffTime)
+		if sleep > remaining {
+			sleep = remaining
+		}
+
+		log.Info().
+			Int("attempt", attempt).
+			Dur("retryIn", sleep).
+			Err(err).
+			Msg("initial rabbitmq connection failed; will retry")
+
+		select {
+		case <-ctx.Done():
+			log.Debug().
+				Int("attempts", attempt).
+				Msg("initial rabbitmq connection cancelled by context during backoff")
+			return fmt.Errorf("initial rabbitmq connection cancelled after %d attempt(s): %w", attempt, ctx.Err())
+		case <-time.After(sleep):
+		}
+
+		backoffTime *= 2
+		if backoffTime > maxBackoff {
+			backoffTime = maxBackoff
+		}
+	}
 }
 
 // NewConnectionManagerFromCredentials creates a ConnectionManager from
@@ -142,6 +274,8 @@ func NewConnectionManager(ctx context.Context, url string, config *amqp.Config) 
 // vhost may be empty to use the default vhost ("/").
 // tlsConfig may be nil; if non-nil it is used for TLS (typically with "amqps").
 //
+// Any ConnectionOption values are forwarded to NewConnectionManager unchanged.
+//
 // Example:
 //
 //	cm, err := rabbitmq.NewConnectionManagerFromCredentials(
@@ -156,6 +290,7 @@ func NewConnectionManagerFromCredentials(
 	port int,
 	vhost string,
 	tlsConfig *tls.Config,
+	opts ...ConnectionOption,
 ) (*ConnectionManager, error) {
 	// Build a credential-free URL — credentials travel via SASL, not the URL.
 	credentialFreeURL, err := BuildAMQPURL(scheme, "", "", host, port, vhost)
@@ -179,7 +314,7 @@ func NewConnectionManagerFromCredentials(
 		TLSClientConfig: tlsConfig,
 	}
 
-	return NewConnectionManager(ctx, credentialFreeURL, &cfg)
+	return NewConnectionManager(ctx, credentialFreeURL, &cfg, opts...)
 }
 
 // connect establishes a new AMQP connection using either the provided config

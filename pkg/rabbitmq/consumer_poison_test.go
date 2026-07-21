@@ -11,7 +11,7 @@ import (
 // when the message has not yet reached the max redeliveries.
 func TestRequeueWithLimitBelowThreshold(t *testing.T) {
 	ctx := context.Background()
-	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil, WithInitialConnectMaxElapsed(-1))
 	if err != nil {
 		t.Skipf("skipping: cannot connect to RabbitMQ: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestRequeueWithLimitBelowThreshold(t *testing.T) {
 // when the message has reached the max redeliveries.
 func TestRequeueWithLimitAtThreshold(t *testing.T) {
 	ctx := context.Background()
-	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil, WithInitialConnectMaxElapsed(-1))
 	if err != nil {
 		t.Skipf("skipping: cannot connect to RabbitMQ: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestRequeueWithLimitAtThreshold(t *testing.T) {
 // when the message has exceeded the max redeliveries.
 func TestRequeueWithLimitExceedsThreshold(t *testing.T) {
 	ctx := context.Background()
-	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil, WithInitialConnectMaxElapsed(-1))
 	if err != nil {
 		t.Skipf("skipping: cannot connect to RabbitMQ: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestRequeueWithLimitExceedsThreshold(t *testing.T) {
 // when there is no x-death header (first delivery).
 func TestRequeueWithLimitNoXDeathHeader(t *testing.T) {
 	ctx := context.Background()
-	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil, WithInitialConnectMaxElapsed(-1))
 	if err != nil {
 		t.Skipf("skipping: cannot connect to RabbitMQ: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestRequeueWithLimitNoXDeathHeader(t *testing.T) {
 // when headers are nil.
 func TestRequeueWithLimitNilHeaders(t *testing.T) {
 	ctx := context.Background()
-	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil)
+	cm, err := NewConnectionManager(ctx, "amqp://guest:guest@localhost:5672/", nil, WithInitialConnectMaxElapsed(-1))
 	if err != nil {
 		t.Skipf("skipping: cannot connect to RabbitMQ: %v", err)
 	}
